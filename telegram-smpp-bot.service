@@ -1,0 +1,11 @@
+[Unit]
+Description=Telegram SMPP bot
+After=network-online.target
+
+[Service]
+Type=simple
+User=smsbot
+ExecStart=/usr/local/bin/telegram-smpp-bot
+
+[Install]
+WantedBy=multi-user.target

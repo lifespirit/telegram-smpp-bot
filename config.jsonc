@@ -1,0 +1,11 @@
+{
+ "name": "telegram-smpp-bot",
+ "address": "127.0.0.1:8090",
+ "botid": "bot111111",
+ "botkey": "AAAABBBBCCCCC",
+ "chatid": "1234",
+ "smpp": "192.168.11.1:7777",
+ "username": "goip",
+ "password": "GOPASS",
+ "debug": 3
+}
