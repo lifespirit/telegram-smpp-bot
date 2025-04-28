@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"github.com/fiorix/go-smpp/smpp"
 	"github.com/fiorix/go-smpp/smpp/pdu"
@@ -12,41 +13,77 @@ import (
 	"golang.org/x/time/rate"
 	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
-	"net/url"
 	"os"
-	"time"
+	"strings"
 )
 
 type Config struct {
-	Name     string
-	Botid    string
-	Botkey   string
-	Chatid   string
-	Address  string
-	Smpp     string
-	Username string
-	Password string
-	Debug    int
+	Name      string
+	Botid     string
+	Botkey    string
+	Chattype  string
+	Chatid    string
+	Chattopic string
+	Address   string
+	Smpp      string
+	Username  string
+	Password  string
+	Debug     int
 }
 
 var config = new(Config)
 
+func createForm(form map[string]string) (string, io.Reader, error) {
+	body := new(bytes.Buffer)
+	mp := multipart.NewWriter(body)
+	defer mp.Close()
+	for key, val := range form {
+		if strings.HasPrefix(val, "@") {
+			val = val[1:]
+			file, err := os.Open(val)
+			if err != nil {
+				return "", nil, err
+			}
+			defer file.Close()
+			part, err := mp.CreateFormFile(key, val)
+			if err != nil {
+				return "", nil, err
+			}
+			_, err = io.Copy(part, file)
+			if err != nil {
+				log.Printf("Can't copy file %s to part %s. Error: %s", key, val, err)
+			}
+		} else {
+			err := mp.WriteField(key, val)
+			if err != nil {
+				log.Printf("Can't write key %s with value %s to body. Error: %s", key, val, err)
+			}
+		}
+	}
+	return mp.FormDataContentType(), body, nil
+}
+
 func sendMessage(m string) {
-	apiURL := "https://api.telegram.org/" + config.Botid + ":" + config.Botkey + "/sendMessage?chat_id=" + config.Chatid + "&disable_web_page_preview=true&parse_mode=HTML&text="
-	if config.Debug < 2 {
-		log.Printf("Request: %s%s", apiURL, m)
+	apiURL := "https://api.telegram.org/" + config.Botid + ":" + config.Botkey + "/sendMessage"
+	form := map[string]string{"disable_web_page_preview": "true", "parse_mode": "HTML", "chat_id": config.Chatid}
+	if config.Chattype == "topic" {
+		form["reply_to_message_id"] = config.Chattopic
 	}
-	apiURL = apiURL + url.QueryEscape(m)
-	if config.Debug < 3 {
-		log.Printf("Telegram API request: %s", apiURL)
-	}
-	client := &http.Client{Timeout: time.Second * 10}
-	req, err := http.NewRequest("GET", apiURL, nil)
+
+	form["text"] = m
+	ct, body, err := createForm(form)
 	if err != nil {
-		log.Printf("Can't create message for Telegram. Error: %s", err)
+		log.Printf("Error %s when send telegram message form", err)
 	}
-	resp, err := client.Do(req)
+
+	if config.Debug < 3 {
+		log.Printf("Telegram API request to URL %s with body: %s", apiURL, body)
+	}
+	resp, err := http.Post(apiURL, ct, body)
+	defer resp.Body.Close()
+
 	if err != nil {
 		log.Printf("Can't send message to Telegram. Error: %s", err)
 	}
