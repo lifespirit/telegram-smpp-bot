@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"github.com/fiorix/go-smpp/smpp"
 	"github.com/fiorix/go-smpp/smpp/pdu"
 	"github.com/fiorix/go-smpp/smpp/pdu/pdufield"
@@ -11,12 +12,20 @@ import (
 	"golang.org/x/text/encoding/unicode"
 	"golang.org/x/text/transform"
 	"golang.org/x/time/rate"
+	"html"
 	"io"
 	"log"
 	"mime/multipart"
 	"net/http"
 	"os"
 	"strings"
+	"time"
+)
+
+const (
+	telegramQueueSize   = 1000
+	telegramRetryDelay  = 5 * time.Second
+	telegramHTTPTimeout = 30 * time.Second
 )
 
 type Config struct {
@@ -34,6 +43,8 @@ type Config struct {
 }
 
 var config = new(Config)
+var telegramQueue chan string
+var telegramHTTPClient = &http.Client{Timeout: telegramHTTPTimeout}
 
 func createForm(form map[string]string) (string, io.Reader, error) {
 	body := new(bytes.Buffer)
@@ -65,7 +76,46 @@ func createForm(form map[string]string) (string, io.Reader, error) {
 	return mp.FormDataContentType(), body, nil
 }
 
+func startTelegramSender() {
+	telegramQueue = make(chan string, telegramQueueSize)
+
+	go func() {
+		for msg := range telegramQueue {
+			attempt := 1
+			for {
+				if err := sendTelegramMessage(msg); err != nil {
+					log.Printf("Can't send message to Telegram on attempt %d, retry after %s. Queue length: %d/%d. Error: %s", attempt, telegramRetryDelay, len(telegramQueue), cap(telegramQueue), err)
+					attempt++
+					time.Sleep(telegramRetryDelay)
+					continue
+				}
+
+				if attempt > 1 {
+					log.Printf("Telegram message sent after %d attempts", attempt)
+				}
+				break
+			}
+		}
+	}()
+}
+
 func sendMessage(m string) {
+	if telegramQueue == nil {
+		if err := sendTelegramMessage(m); err != nil {
+			log.Printf("Can't send message to Telegram. Error: %s", err)
+		}
+		return
+	}
+
+	select {
+	case telegramQueue <- m:
+	default:
+		log.Printf("Telegram message queue is full (%d/%d), waiting for a free slot", len(telegramQueue), cap(telegramQueue))
+		telegramQueue <- m
+	}
+}
+
+func sendTelegramMessage(m string) error {
 	apiURL := "https://api.telegram.org/" + config.Botid + ":" + config.Botkey + "/sendMessage"
 	form := map[string]string{"disable_web_page_preview": "true", "parse_mode": "HTML", "chat_id": config.Chatid}
 	if config.Chattype == "topic" {
@@ -75,33 +125,29 @@ func sendMessage(m string) {
 	form["text"] = m
 	ct, body, err := createForm(form)
 	if err != nil {
-		log.Printf("Error %s when send telegram message form", err)
+		return fmt.Errorf("create telegram message form: %w", err)
 	}
 
 	if config.Debug < 3 {
-		log.Printf("Telegram API request to URL %s with body: %s", apiURL, body)
+		log.Printf("Telegram API request with body: %s", body)
 	}
-	resp, err := http.Post(apiURL, ct, body)
+
+	resp, err := telegramHTTPClient.Post(apiURL, ct, body)
+	if err != nil {
+		return fmt.Errorf("send telegram message: %w", err)
+	}
 	defer resp.Body.Close()
 
+	bodyText, err := io.ReadAll(resp.Body)
 	if err != nil {
-		log.Printf("Can't send message to Telegram. Error: %s", err)
+		return fmt.Errorf("read telegram response: %w", err)
 	}
-	defer resp.Body.Close()
 
-	if err != nil {
-		log.Printf("Can't send message to Telegram. Error: %s", err)
-	} else {
-		bodyText, err := io.ReadAll(resp.Body)
-		if err != nil {
-			log.Printf("Can't get answer from Telegram. Error: %s", err)
-		} else {
-			s := string(bodyText)
-			if resp.StatusCode != 200 {
-				log.Printf("Unexpected answer from Telegram! I get: %s", s)
-			}
-		}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected telegram response %s: %s", resp.Status, string(bodyText))
 	}
+
+	return nil
 }
 
 func readConfig() {
@@ -117,6 +163,7 @@ func readConfig() {
 func main() {
 
 	readConfig()
+	startTelegramSender()
 
 	// Make an tranformer that converts MS-Win default to UTF8:
 	win16be := unicode.UTF16(unicode.BigEndian, unicode.IgnoreBOM)
@@ -155,7 +202,7 @@ func main() {
 			if config.Debug < 2 {
 				log.Printf("Text: %q", text)
 			}
-			sendMessage("SMS from " + src.String() + " to " + dst.String() + " :\n" + text)
+			sendMessage(fmt.Sprintf("SMS from %s to %s :\n%s", html.EscapeString(src.String()), html.EscapeString(dst.String()), html.EscapeString(text)))
 		}
 	}
 	lm := rate.NewLimiter(rate.Limit(10), 1) // Max rate of 10/s.
